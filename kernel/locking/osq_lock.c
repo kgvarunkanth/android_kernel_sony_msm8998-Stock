@@ -1,7 +1,6 @@
 #include <linux/percpu.h>
 #include <linux/sched.h>
 #include <linux/osq_lock.h>
-#include <linux/sched/rt.h>
 
 /*
  * An MCS like lock especially tailored for optimistic spinning for sleeping
@@ -86,7 +85,6 @@ bool osq_lock(struct optimistic_spin_queue *lock)
 {
 	struct optimistic_spin_node *node = this_cpu_ptr(&osq_node);
 	struct optimistic_spin_node *prev, *next;
-	struct task_struct *task = current;
 	int curr = encode_cpu(smp_processor_id());
 	int old;
 
@@ -108,29 +106,16 @@ bool osq_lock(struct optimistic_spin_queue *lock)
 	node->prev = prev;
 
 	/*
-	 * We need to avoid reordering of link updation sequence of osq.
-	 * A case in which the status of optimistic spin queue is
-	 * CPU6->CPU2 in which CPU6 has acquired the lock. At this point
-	 * if CPU0 comes in to acquire osq_lock, it will update the tail
-	 * count. After tail count update if CPU2 starts to unqueue itself
-	 * from optimistic spin queue, it will find updated tail count with
-	 * CPU0 and update CPU2 node->next to NULL in osq_wait_next(). If
-	 * reordering of following stores happen then prev->next where prev
-	 * being CPU2 would be updated to point to CPU0 node:
-	 *      node->prev = prev;
-	 *      WRITE_ONCE(prev->next, node);
+	 * osq_lock()			unqueue
 	 *
-	 * At this point if next instruction
-	 *      WRITE_ONCE(next->prev, prev);
-	 * in CPU2 path is committed before the update of CPU0 node->prev =
-	 * prev then CPU0 node->prev will point to CPU6 node. At this point
-	 * if CPU0 path's node->prev = prev is committed resulting in change
-	 * of CPU0 prev back to CPU2 node. CPU2 node->next is NULL, so if
-	 * CPU0 gets into unqueue path of osq_lock it will keep spinning
-	 * in infinite loop as condition prev->next == node will never be
-	 * true.
+	 * node->prev = prev		osq_wait_next()
+	 * WMB				MB
+	 * prev->next = node		next->prev = prev // unqueue-C
+	 *
+	 * Here 'node->prev' and 'next->prev' are the same variable and we need
+	 * to ensure these stores happen in-order to avoid corrupting the list.
 	 */
-	smp_mb();
+	smp_wmb();
 
 	WRITE_ONCE(prev->next, node);
 
@@ -146,13 +131,8 @@ bool osq_lock(struct optimistic_spin_queue *lock)
 	while (!READ_ONCE(node->locked)) {
 		/*
 		 * If we need to reschedule bail... so we can block.
-		 * If a task spins on owner on a CPU after acquiring
-		 * osq_lock while a RT task spins on another CPU  to
-		 * acquire osq_lock, it will starve the owner from
-		 * completing if owner is to be scheduled on the same CPU.
-		 * It will be a live lock.
 		 */
-		if (need_resched() || rt_task(task))
+		if (need_resched())
 			goto unqueue;
 
 		cpu_relax_lowlatency();

@@ -138,7 +138,9 @@ int tipc_buf_append(struct sk_buff **headbuf, struct sk_buff **buf)
 	if (fragid == FIRST_FRAGMENT) {
 		if (unlikely(head))
 			goto err;
-		if (unlikely(skb_unclone(frag, GFP_ATOMIC)))
+		if (skb_cloned(frag))
+			frag = skb_copy(frag, GFP_ATOMIC);
+		if (unlikely(!frag))
 			goto err;
 		head = *headbuf = frag;
 		*buf = NULL;
@@ -541,7 +543,7 @@ bool tipc_msg_lookup_dest(struct net *net, struct sk_buff *skb, int *err)
 		return false;
 	if (msg_errcode(msg))
 		return false;
-	*err = -TIPC_ERR_NO_NAME;
+	*err = TIPC_ERR_NO_NAME;
 	if (skb_linearize(skb))
 		return false;
 	msg = buf_msg(skb);

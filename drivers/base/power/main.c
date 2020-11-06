@@ -38,11 +38,6 @@
 #include <linux/cpufreq.h>
 #include <linux/cpuidle.h>
 #include <linux/timer.h>
-#include <linux/wakeup_reason.h>
-#ifdef CONFIG_PM_WAKEUP_TIMES
-#include <linux/math64.h>
-#include <linux/wait.h>
-#endif
 
 #include "../base.h"
 #include "power.h"
@@ -66,11 +61,6 @@ static LIST_HEAD(dpm_late_early_list);
 static LIST_HEAD(dpm_noirq_list);
 
 struct suspend_stats suspend_stats;
-#ifdef CONFIG_PM_WAKEUP_TIMES
-struct suspend_stats_queue suspend_stats_queue;
-static ktime_t suspend_start_time;
-static ktime_t resume_start_time;
-#endif
 static DEFINE_MUTEX(dpm_list_mtx);
 static pm_message_t pm_transition;
 
@@ -140,7 +130,6 @@ void device_pm_add(struct device *dev)
 {
 	pr_debug("PM: Adding info for %s:%s\n",
 		 dev->bus ? dev->bus->name : "No Bus", dev_name(dev));
-	device_pm_check_callbacks(dev);
 	mutex_lock(&dpm_list_mtx);
 	if (dev->parent && dev->parent->power.is_prepared)
 		dev_warn(dev, "parent %s should not be sleeping\n",
@@ -163,7 +152,6 @@ void device_pm_remove(struct device *dev)
 	mutex_unlock(&dpm_list_mtx);
 	device_wakeup_disable(dev);
 	pm_runtime_remove(dev);
-	device_pm_check_callbacks(dev);
 }
 
 /**
@@ -176,12 +164,6 @@ void device_pm_move_before(struct device *deva, struct device *devb)
 	pr_debug("PM: Moving %s:%s before %s:%s\n",
 		 deva->bus ? deva->bus->name : "No Bus", dev_name(deva),
 		 devb->bus ? devb->bus->name : "No Bus", dev_name(devb));
-	if (!((devb->pm_domain) || (devb->type && devb->type->pm)
-		|| (devb->class && (devb->class->pm || devb->class->resume))
-		|| (devb->bus && (devb->bus->pm || devb->bus->resume)) ||
-		(devb->driver && devb->driver->pm))) {
-		device_pm_add(devb);
-	}
 	/* Delete deva from dpm_list and reinsert before devb. */
 	list_move_tail(&deva->power.entry, &devb->power.entry);
 }
@@ -196,12 +178,6 @@ void device_pm_move_after(struct device *deva, struct device *devb)
 	pr_debug("PM: Moving %s:%s after %s:%s\n",
 		 deva->bus ? deva->bus->name : "No Bus", dev_name(deva),
 		 devb->bus ? devb->bus->name : "No Bus", dev_name(devb));
-	if (!((devb->pm_domain) || (devb->type && devb->type->pm)
-		|| (devb->class && (devb->class->pm || devb->class->resume))
-		|| (devb->bus && (devb->bus->pm || devb->bus->resume)) ||
-		(devb->driver && devb->driver->pm))) {
-		device_pm_add(devb);
-	}
 	/* Delete deva from dpm_list and reinsert after devb. */
 	list_move(&deva->power.entry, &devb->power.entry);
 }
@@ -401,100 +377,6 @@ static void dpm_show_time(ktime_t starttime, pm_message_t state, char *info)
 		info ?: "", info ? " " : "", pm_verb(state.event),
 		usecs / USEC_PER_MSEC, usecs % USEC_PER_MSEC);
 }
-
-#ifdef CONFIG_PM_WAKEUP_TIMES
-void dpm_log_start_time(pm_message_t state)
-{
-	switch (state.event) {
-	case PM_EVENT_RESUME:
-		resume_start_time = ktime_get_boottime();
-		break;
-	case PM_EVENT_SUSPEND:
-		suspend_start_time = ktime_get_boottime();
-		break;
-	default:
-		break;
-	}
-}
-EXPORT_SYMBOL_GPL(dpm_log_start_time);
-
-void dpm_log_wakeup_stats(pm_message_t state)
-{
-	ktime_t *start_time, *avg_time, end_time, duration, prev_duration, sum;
-	struct stats_wakeup_time *min_time, *max_time, *last_time, prev;
-	u64 avg_ns;
-	char buf[32] = {0};
-	unsigned int nr = 0;
-
-	switch (state.event) {
-	case PM_EVENT_RESUME:
-		snprintf(buf, sizeof(buf), "%s", "resume time:");
-		start_time = &resume_start_time;
-		min_time = &suspend_stats.resume_min_time;
-		max_time = &suspend_stats.resume_max_time;
-		last_time = &suspend_stats.resume_last_time;
-		avg_time = &suspend_stats.resume_avg_time;
-		break;
-	case PM_EVENT_SUSPEND:
-		snprintf(buf, sizeof(buf), "%s", "suspend time:");
-		start_time = &suspend_start_time;
-		min_time = &suspend_stats.suspend_min_time;
-		max_time = &suspend_stats.suspend_max_time;
-		last_time = &suspend_stats.suspend_last_time;
-		avg_time = &suspend_stats.suspend_avg_time;
-		break;
-	default:
-		return;
-	}
-
-	if (!ktime_to_ns(*start_time))
-		return;
-
-	/* Calculate duration and update last time */
-	end_time = ktime_get_boottime();
-	prev = *last_time;
-	prev_duration = ktime_sub(prev.end, prev.start);
-	last_time->end = end_time;
-	last_time->start = *start_time;
-	duration = ktime_sub(end_time, *start_time);
-
-	/* Update max time */
-	if (ktime_compare(duration,
-		ktime_sub(max_time->end, max_time->start)) > 0)
-		*max_time = *last_time;
-
-	/* Update min time */
-	if (!ktime_to_ns(ktime_sub(min_time->end, min_time->start)))
-		*min_time = *last_time;
-
-	if (ktime_compare(duration,
-		ktime_sub(min_time->end, min_time->start)) < 0)
-		*min_time = *last_time;
-
-	/* Compute the avg of current, previous and previous average times */
-	if (ktime_to_ns(prev_duration))
-		nr++;
-
-	if (ktime_to_ns(*avg_time))
-		nr++;
-
-	sum = ktime_add(ktime_add(*avg_time, prev_duration), duration);
-	avg_ns = div_u64(ktime_to_ns(sum), (nr + 1));
-	*avg_time = ktime_set(0, avg_ns);
-	*start_time = ktime_set(0, 0);
-
-	pr_debug("%s\n%s  %llums\n%s  %llums\n %s  %llums\n%s %llums\n", buf,
-			"  min:",
-			ktime_to_ms(ktime_sub(min_time->end, min_time->start)),
-			"  max:",
-			ktime_to_ms(ktime_sub(max_time->end, max_time->start)),
-			"  last:", ktime_to_ms(duration),
-			"  avg:", ktime_to_ms(*avg_time));
-	suspend_stats_queue.resume_done = 1;
-	wake_up(&suspend_stats_queue.wait_queue);
-}
-EXPORT_SYMBOL_GPL(dpm_log_wakeup_stats);
-#endif
 
 static int dpm_run_callback(pm_callback_t cb, struct device *dev,
 			    pm_message_t state, char *info)
@@ -1471,7 +1353,6 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 	pm_callback_t callback = NULL;
 	char *info = NULL;
 	int error = 0;
-	char suspend_abort[MAX_SUSPEND_ABORT_LEN];
 	DECLARE_DPM_WATCHDOG_ON_STACK(wd);
 
 	TRACE_DEVICE(dev);
@@ -1479,28 +1360,36 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 
 	dpm_wait_for_children(dev, async);
 
-	if (async_error)
+	if (async_error) {
+		dev->power.direct_complete = false;
 		goto Complete;
+	}
 
 	/*
-	 * If a device configured to wake up the system from sleep states
-	 * has been suspended at run time and there's a resume request pending
-	 * for it, this is equivalent to the device signaling wakeup, so the
-	 * system suspend operation should be aborted.
+	 * Wait for possible runtime PM transitions of the device in progress
+	 * to complete and if there's a runtime resume request pending for it,
+	 * resume it before proceeding with invoking the system-wide suspend
+	 * callbacks for it.
+	 *
+	 * If the system-wide suspend callbacks below change the configuration
+	 * of the device, they must disable runtime PM for it or otherwise
+	 * ensure that its runtime-resume callbacks will not be confused by that
+	 * change in case they are invoked going forward.
 	 */
-	if (pm_runtime_barrier(dev) && device_may_wakeup(dev))
-		pm_wakeup_event(dev, 0);
+	pm_runtime_barrier(dev);
 
 	if (pm_wakeup_pending()) {
-		pm_get_active_wakeup_sources(suspend_abort,
-			MAX_SUSPEND_ABORT_LEN);
-		log_suspend_abort_reason(suspend_abort);
+		dev->power.direct_complete = false;
 		async_error = -EBUSY;
 		goto Complete;
 	}
 
 	if (dev->power.syscore)
 		goto Complete;
+
+	/* Avoid direct_complete to let wakeup_path propagate. */
+	if (device_may_wakeup(dev) || dev->power.wakeup_path)
+		dev->power.direct_complete = false;
 
 	if (dev->power.direct_complete) {
 		if (pm_runtime_status_suspended(dev)) {
@@ -1697,11 +1586,6 @@ static int device_prepare(struct device *dev, pm_message_t state)
 
 	dev->power.wakeup_path = device_may_wakeup(dev);
 
-	if (dev->power.no_pm_callbacks) {
-		ret = 1;	/* Let device go direct_complete */
-		goto unlock;
-	}
-
 	if (dev->pm_domain) {
 		info = "preparing power domain ";
 		callback = dev->pm_domain->ops.prepare;
@@ -1724,7 +1608,6 @@ static int device_prepare(struct device *dev, pm_message_t state)
 	if (callback)
 		ret = callback(dev);
 
-unlock:
 	device_unlock(dev);
 
 	if (ret < 0) {
@@ -1853,30 +1736,3 @@ void dpm_for_each_dev(void *data, void (*fn)(struct device *, void *))
 	device_pm_unlock();
 }
 EXPORT_SYMBOL_GPL(dpm_for_each_dev);
-
-static bool pm_ops_is_empty(const struct dev_pm_ops *ops)
-{
-	if (!ops)
-		return true;
-
-	return !ops->prepare &&
-	       !ops->suspend &&
-	       !ops->suspend_late &&
-	       !ops->suspend_noirq &&
-	       !ops->resume_noirq &&
-	       !ops->resume_early &&
-	       !ops->resume &&
-	       !ops->complete;
-}
-
-void device_pm_check_callbacks(struct device *dev)
-{
-	spin_lock_irq(&dev->power.lock);
-	dev->power.no_pm_callbacks =
-		(!dev->bus || pm_ops_is_empty(dev->bus->pm)) &&
-		(!dev->class || pm_ops_is_empty(dev->class->pm)) &&
-		(!dev->type || pm_ops_is_empty(dev->type->pm)) &&
-		(!dev->pm_domain || pm_ops_is_empty(&dev->pm_domain->ops)) &&
-		(!dev->driver || pm_ops_is_empty(dev->driver->pm));
-	spin_unlock_irq(&dev->power.lock);
-}

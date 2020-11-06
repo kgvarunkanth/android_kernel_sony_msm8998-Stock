@@ -81,7 +81,8 @@ static inline void __get_page_tail_foll(struct page *page,
 	 * speculative page access (like in
 	 * page_cache_get_speculative()) on tail pages.
 	 */
-	VM_BUG_ON_PAGE(atomic_read(&compound_head(page)->_count) <= 0, page);
+	VM_BUG_ON_PAGE(page_ref_zero_or_close_to_overflow(compound_head(page)),
+		       page);
 	if (get_page_head)
 		atomic_inc(&compound_head(page)->_count);
 	get_huge_page_tail(page);
@@ -106,9 +107,32 @@ static inline void get_page_foll(struct page *page)
 		 * Getting a normal page or the head of a compound page
 		 * requires to already have an elevated page->_count.
 		 */
-		VM_BUG_ON_PAGE(atomic_read(&page->_count) <= 0, page);
+		VM_BUG_ON_PAGE(page_ref_zero_or_close_to_overflow(page), page);
 		atomic_inc(&page->_count);
 	}
+}
+
+static inline __must_check bool try_get_page_foll(struct page *page)
+{
+	if (unlikely(PageTail(page))) {
+		if (WARN_ON_ONCE(atomic_read(&compound_head(page)->_count) <= 0))
+			return false;
+		/*
+		 * This is safe only because
+		 * __split_huge_page_refcount() can't run under
+		 * get_page_foll() because we hold the proper PT lock.
+		 */
+		__get_page_tail_foll(page, true);
+	} else {
+		/*
+		 * Getting a normal page or the head of a compound page
+		 * requires to already have an elevated page->_count.
+		 */
+		if (WARN_ON_ONCE(atomic_read(&page->_count) <= 0))
+			return false;
+		atomic_inc(&page->_count);
+	}
+	return true;
 }
 
 extern unsigned long highest_memmap_pfn;
@@ -454,6 +478,7 @@ struct tlbflush_unmap_batch;
 #ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
 void try_to_unmap_flush(void);
 void try_to_unmap_flush_dirty(void);
+void flush_tlb_batched_pending(struct mm_struct *mm);
 #else
 static inline void try_to_unmap_flush(void)
 {
@@ -461,6 +486,8 @@ static inline void try_to_unmap_flush(void)
 static inline void try_to_unmap_flush_dirty(void)
 {
 }
-
+static inline void flush_tlb_batched_pending(struct mm_struct *mm)
+{
+}
 #endif /* CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH */
 #endif	/* __MM_INTERNAL_H */

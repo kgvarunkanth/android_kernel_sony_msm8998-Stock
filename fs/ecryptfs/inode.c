@@ -248,44 +248,10 @@ int ecryptfs_initialize_file(struct dentry *ecryptfs_dentry,
 			ecryptfs_dentry, rc);
 		goto out;
 	}
-#ifdef CONFIG_WTL_ENCRYPTION_FILTER
-	mutex_lock(&crypt_stat->cs_mutex);
-	if (crypt_stat->flags & ECRYPTFS_ENCRYPTED) {
-		struct dentry *fp_dentry =
-			ecryptfs_inode_to_private(ecryptfs_inode)
-			->lower_file->f_path.dentry;
-		struct ecryptfs_mount_crypt_stat *mount_crypt_stat =
-			&ecryptfs_superblock_to_private(ecryptfs_dentry->d_sb)
-			->mount_crypt_stat;
-		char filename[NAME_MAX+1] = {0};
-		if (fp_dentry->d_name.len <= NAME_MAX)
-			memcpy(filename, fp_dentry->d_name.name,
-					fp_dentry->d_name.len + 1);
-
-		if ((mount_crypt_stat->flags & ECRYPTFS_ENABLE_NEW_PASSTHROUGH)
-		|| ((mount_crypt_stat->flags & ECRYPTFS_ENABLE_FILTERING) &&
-			(is_file_name_match(mount_crypt_stat, fp_dentry) ||
-			is_file_ext_match(mount_crypt_stat, filename)))) {
-			crypt_stat->flags &= ~(ECRYPTFS_I_SIZE_INITIALIZED
-				| ECRYPTFS_ENCRYPTED);
-			ecryptfs_put_lower_file(ecryptfs_inode);
-		} else {
-			rc = ecryptfs_write_metadata(ecryptfs_dentry,
-				 ecryptfs_inode);
-			if (rc)
-				printk(
-				KERN_ERR "Error writing headers; rc = [%d]\n"
-				    , rc);
-			ecryptfs_put_lower_file(ecryptfs_inode);
-		}
-	}
-	mutex_unlock(&crypt_stat->cs_mutex);
-#else
 	rc = ecryptfs_write_metadata(ecryptfs_dentry, ecryptfs_inode);
 	if (rc)
 		printk(KERN_ERR "Error writing headers; rc = [%d]\n", rc);
 	ecryptfs_put_lower_file(ecryptfs_inode);
-#endif
 out:
 	return rc;
 }
@@ -300,15 +266,12 @@ out:
  *
  * Returns zero on success; non-zero on error condition
  */
-
-
 static int
 ecryptfs_create(struct inode *directory_inode, struct dentry *ecryptfs_dentry,
 		umode_t mode, bool excl)
 {
 	struct inode *ecryptfs_inode;
 	int rc;
-	struct ecryptfs_crypt_stat *crypt_stat;
 
 	ecryptfs_inode = ecryptfs_do_create(directory_inode, ecryptfs_dentry,
 					    mode);
@@ -318,7 +281,6 @@ ecryptfs_create(struct inode *directory_inode, struct dentry *ecryptfs_dentry,
 		rc = PTR_ERR(ecryptfs_inode);
 		goto out;
 	}
-
 	/* At this point, a file exists on "disk"; we need to make sure
 	 * that this on disk file is prepared to be an ecryptfs file */
 	rc = ecryptfs_initialize_file(ecryptfs_dentry, ecryptfs_inode);
@@ -330,15 +292,7 @@ ecryptfs_create(struct inode *directory_inode, struct dentry *ecryptfs_dentry,
 		iput(ecryptfs_inode);
 		goto out;
 	}
-	unlock_new_inode(ecryptfs_inode);
-
-	crypt_stat = &ecryptfs_inode_to_private(ecryptfs_inode)->crypt_stat;
-	if (get_events() && get_events()->open_cb)
-			get_events()->open_cb(
-				ecryptfs_inode_to_lower(ecryptfs_inode),
-					crypt_stat);
-
-	d_instantiate(ecryptfs_dentry, ecryptfs_inode);
+	d_instantiate_new(ecryptfs_dentry, ecryptfs_inode);
 out:
 	return rc;
 }
@@ -381,9 +335,9 @@ static int ecryptfs_lookup_interpose(struct dentry *dentry,
 				     struct dentry *lower_dentry,
 				     struct inode *dir_inode)
 {
-	struct inode *inode, *lower_inode = d_inode(lower_dentry);
+	struct path *path = ecryptfs_dentry_to_lower_path(dentry->d_parent);
+	struct inode *inode, *lower_inode;
 	struct ecryptfs_dentry_info *dentry_info;
-	struct vfsmount *lower_mnt;
 	int rc = 0;
 
 	dentry_info = kmem_cache_alloc(ecryptfs_dentry_info_cache, GFP_KERNEL);
@@ -395,15 +349,22 @@ static int ecryptfs_lookup_interpose(struct dentry *dentry,
 		return -ENOMEM;
 	}
 
-	lower_mnt = mntget(ecryptfs_dentry_to_lower_mnt(dentry->d_parent));
-	fsstack_copy_attr_atime(dir_inode, d_inode(lower_dentry->d_parent));
+	fsstack_copy_attr_atime(dir_inode, d_inode(path->dentry));
 	BUG_ON(!d_count(lower_dentry));
 
 	ecryptfs_set_dentry_private(dentry, dentry_info);
-	dentry_info->lower_path.mnt = lower_mnt;
+	dentry_info->lower_path.mnt = mntget(path->mnt);
 	dentry_info->lower_path.dentry = lower_dentry;
 
-	if (d_really_is_negative(lower_dentry)) {
+	/*
+	 * negative dentry can go positive under us here - its parent is not
+	 * locked.  That's OK and that could happen just as we return from
+	 * ecryptfs_lookup() anyway.  Just need to be careful and fetch
+	 * ->d_inode only once - it's not stable here.
+	 */
+	lower_inode = READ_ONCE(lower_dentry->d_inode);
+
+	if (!lower_inode) {
 		/* We want to add because we couldn't find in lower */
 		d_add(dentry, NULL);
 		return 0;

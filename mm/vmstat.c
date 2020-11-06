@@ -738,6 +738,7 @@ const char * const vmstat_text[] = {
 	"nr_slab_unreclaimable",
 	"nr_page_table_pages",
 	"nr_kernel_stack",
+	"nr_overhead",
 	"nr_unstable",
 	"nr_bounce",
 	"nr_vmscan_write",
@@ -763,7 +764,6 @@ const char * const vmstat_text[] = {
 	"workingset_nodereclaim",
 	"nr_anon_transparent_hugepages",
 	"nr_free_cma",
-	"nr_swapcache",
 
 	/* enum writeback_stat_item counters */
 	"nr_dirty_threshold",
@@ -773,7 +773,6 @@ const char * const vmstat_text[] = {
 	/* enum vm_event_item counters */
 	"pgpgin",
 	"pgpgout",
-	"pgpgoutclean",
 	"pswpin",
 	"pswpout",
 
@@ -827,7 +826,6 @@ const char * const vmstat_text[] = {
 	"compact_stall",
 	"compact_fail",
 	"compact_success",
-	"compact_daemon_wake",
 #endif
 
 #ifdef CONFIG_HUGETLB_PAGE
@@ -859,10 +857,8 @@ const char * const vmstat_text[] = {
 #endif
 #endif /* CONFIG_MEMORY_BALLOON */
 #ifdef CONFIG_DEBUG_TLBFLUSH
-#ifdef CONFIG_SMP
 	"nr_tlb_remote_flush",
 	"nr_tlb_remote_flush_received",
-#endif /* CONFIG_SMP */
 	"nr_tlb_local_flush_all",
 	"nr_tlb_local_flush_one",
 #endif /* CONFIG_DEBUG_TLBFLUSH */
@@ -870,7 +866,6 @@ const char * const vmstat_text[] = {
 #ifdef CONFIG_DEBUG_VM_VMACACHE
 	"vmacache_find_calls",
 	"vmacache_find_hits",
-	"vmacache_full_flushes",
 #endif
 #endif /* CONFIG_VM_EVENTS_COUNTERS */
 };
@@ -906,7 +901,6 @@ static void frag_stop(struct seq_file *m, void *arg)
 
 /* Walk all the zones in a node and print using a callback */
 static void walk_zones_in_node(struct seq_file *m, pg_data_t *pgdat,
-		bool nolock,
 		void (*print)(struct seq_file *m, pg_data_t *, struct zone *))
 {
 	struct zone *zone;
@@ -917,16 +911,27 @@ static void walk_zones_in_node(struct seq_file *m, pg_data_t *pgdat,
 		if (!populated_zone(zone))
 			continue;
 
-		if (!nolock)
-			spin_lock_irqsave(&zone->lock, flags);
+		spin_lock_irqsave(&zone->lock, flags);
 		print(m, pgdat, zone);
-		if (!nolock)
-			spin_unlock_irqrestore(&zone->lock, flags);
+		spin_unlock_irqrestore(&zone->lock, flags);
 	}
 }
 #endif
 
 #ifdef CONFIG_PROC_FS
+static char * const migratetype_names[MIGRATE_TYPES] = {
+	"Unmovable",
+	"Movable",
+	"Reclaimable",
+	"HighAtomic",
+#ifdef CONFIG_CMA
+	"CMA",
+#endif
+#ifdef CONFIG_MEMORY_ISOLATION
+	"Isolate",
+#endif
+};
+
 static void frag_show_print(struct seq_file *m, pg_data_t *pgdat,
 						struct zone *zone)
 {
@@ -944,7 +949,7 @@ static void frag_show_print(struct seq_file *m, pg_data_t *pgdat,
 static int frag_show(struct seq_file *m, void *arg)
 {
 	pg_data_t *pgdat = (pg_data_t *)arg;
-	walk_zones_in_node(m, pgdat, false, frag_show_print);
+	walk_zones_in_node(m, pgdat, frag_show_print);
 	return 0;
 }
 
@@ -985,7 +990,7 @@ static int pagetypeinfo_showfree(struct seq_file *m, void *arg)
 		seq_printf(m, "%6d ", order);
 	seq_putc(m, '\n');
 
-	walk_zones_in_node(m, pgdat, false, pagetypeinfo_showfree_print);
+	walk_zones_in_node(m, pgdat, pagetypeinfo_showfree_print);
 
 	return 0;
 }
@@ -1034,7 +1039,7 @@ static int pagetypeinfo_showblockcount(struct seq_file *m, void *arg)
 	for (mtype = 0; mtype < MIGRATE_TYPES; mtype++)
 		seq_printf(m, "%12s ", migratetype_names[mtype]);
 	seq_putc(m, '\n');
-	walk_zones_in_node(m, pgdat, false, pagetypeinfo_showblockcount_print);
+	walk_zones_in_node(m, pgdat, pagetypeinfo_showblockcount_print);
 
 	return 0;
 }
@@ -1078,11 +1083,7 @@ static void pagetypeinfo_showmixedcount_print(struct seq_file *m,
 
 			page = pfn_to_page(pfn);
 			if (PageBuddy(page)) {
-				unsigned long freepage_order;
-
-				freepage_order = page_order_unsafe(page);
-				if (freepage_order < MAX_ORDER)
-					pfn += (1UL << freepage_order) - 1;
+				pfn += (1UL << page_order(page)) - 1;
 				continue;
 			}
 
@@ -1129,7 +1130,7 @@ static void pagetypeinfo_showmixedcount(struct seq_file *m, pg_data_t *pgdat)
 #ifdef CONFIG_PAGE_OWNER
 	int mtype;
 
-	if (!static_branch_unlikely(&page_owner_inited))
+	if (!page_owner_inited)
 		return;
 
 	drain_all_pages(NULL);
@@ -1139,7 +1140,7 @@ static void pagetypeinfo_showmixedcount(struct seq_file *m, pg_data_t *pgdat)
 		seq_printf(m, "%12s ", migratetype_names[mtype]);
 	seq_putc(m, '\n');
 
-	walk_zones_in_node(m, pgdat, true, pagetypeinfo_showmixedcount_print);
+	walk_zones_in_node(m, pgdat, pagetypeinfo_showmixedcount_print);
 #endif /* CONFIG_PAGE_OWNER */
 }
 
@@ -1272,7 +1273,7 @@ static void zoneinfo_show_print(struct seq_file *m, pg_data_t *pgdat,
 static int zoneinfo_show(struct seq_file *m, void *arg)
 {
 	pg_data_t *pgdat = (pg_data_t *)arg;
-	walk_zones_in_node(m, pgdat, false, zoneinfo_show_print);
+	walk_zones_in_node(m, pgdat, zoneinfo_show_print);
 	return 0;
 }
 
@@ -1349,7 +1350,9 @@ static int vmstat_show(struct seq_file *m, void *arg)
 	unsigned long *l = arg;
 	unsigned long off = l - (unsigned long *)m->private;
 
-	seq_printf(m, "%s %lu\n", vmstat_text[off], *l);
+	seq_puts(m, vmstat_text[off]);
+	seq_put_decimal_ull(m, ' ', *l);
+	seq_putc(m, '\n');
 	return 0;
 }
 
@@ -1387,20 +1390,24 @@ static cpumask_var_t cpu_stat_off;
 
 static void vmstat_update(struct work_struct *w)
 {
-	if (refresh_cpu_vm_stats(true) && !cpu_isolated(smp_processor_id())) {
+	if (refresh_cpu_vm_stats(true)) {
 		/*
 		 * Counters were updated so we expect more updates
 		 * to occur in the future. Keep on running the
 		 * update worker thread.
+		 * If we were marked on cpu_stat_off clear the flag
+		 * so that vmstat_shepherd doesn't schedule us again.
 		 */
-		queue_delayed_work_on(smp_processor_id(), vmstat_wq,
-			this_cpu_ptr(&vmstat_work),
-			round_jiffies_relative(sysctl_stat_interval));
+		if (!cpumask_test_and_clear_cpu(smp_processor_id(),
+						cpu_stat_off)) {
+			queue_delayed_work_on(smp_processor_id(), vmstat_wq,
+				this_cpu_ptr(&vmstat_work),
+				round_jiffies_relative(sysctl_stat_interval));
+		}
 	} else {
 		/*
 		 * We did not update any counters so the app may be in
-		 * a mode where it does not cause counter updates or the cpu
-		 * was isolated.
+		 * a mode where it does not cause counter updates.
 		 * We may be uselessly running vmstat_update.
 		 * Defer the checking for differentials to the
 		 * shepherd thread on a different processor.
@@ -1414,18 +1421,6 @@ static void vmstat_update(struct work_struct *w)
  * until the diffs stay at zero. The function is used by NOHZ and can only be
  * invoked when tick processing is not active.
  */
-void quiet_vmstat(void)
-{
-	if (system_state != SYSTEM_RUNNING)
-		return;
-
-	do {
-		if (!cpumask_test_and_set_cpu(smp_processor_id(), cpu_stat_off))
-			cancel_delayed_work(this_cpu_ptr(&vmstat_work));
-
-	} while (refresh_cpu_vm_stats(false));
-}
-
 /*
  * Check if the diffs for a certain cpu indicate that
  * an update is needed.
@@ -1449,6 +1444,30 @@ static bool need_update(int cpu)
 	return false;
 }
 
+void quiet_vmstat(void)
+{
+	if (system_state != SYSTEM_RUNNING)
+		return;
+
+	/*
+	 * If we are already in hands of the shepherd then there
+	 * is nothing for us to do here.
+	 */
+	if (cpumask_test_and_set_cpu(smp_processor_id(), cpu_stat_off))
+		return;
+
+	if (!need_update(smp_processor_id()))
+		return;
+
+	/*
+	 * Just refresh counters and do not care about the pending delayed
+	 * vmstat_update. It doesn't fire that often to matter and canceling
+	 * it would be too expensive from this path.
+	 * vmstat_shepherd will take care about that for us.
+	 */
+	refresh_cpu_vm_stats(false);
+}
+
 
 /*
  * Shepherd worker thread that checks the
@@ -1466,18 +1485,25 @@ static void vmstat_shepherd(struct work_struct *w)
 
 	get_online_cpus();
 	/* Check processors whose vmstat worker threads have been disabled */
-	for_each_cpu(cpu, cpu_stat_off)
-		if (!cpu_isolated(cpu) && need_update(cpu) &&
-			cpumask_test_and_clear_cpu(cpu, cpu_stat_off))
+	for_each_cpu(cpu, cpu_stat_off) {
+		struct delayed_work *dw = &per_cpu(vmstat_work, cpu);
 
-			queue_delayed_work_on(cpu, vmstat_wq,
-				&per_cpu(vmstat_work, cpu), 0);
-
+		if (need_update(cpu)) {
+			if (cpumask_test_and_clear_cpu(cpu, cpu_stat_off))
+				queue_delayed_work_on(cpu, vmstat_wq, dw, 0);
+		} else {
+			/*
+			 * Cancel the work if quiet_vmstat has put this
+			 * cpu on cpu_stat_off because the work item might
+			 * be still scheduled
+			 */
+			cancel_delayed_work(dw);
+		}
+	}
 	put_online_cpus();
 
 	schedule_delayed_work(&shepherd,
 		round_jiffies_relative(sysctl_stat_interval));
-
 }
 
 static void __init start_shepherd_timer(void)
@@ -1563,7 +1589,7 @@ static int __init setup_vmstat(void)
 #endif
 #ifdef CONFIG_PROC_FS
 	proc_create("buddyinfo", S_IRUGO, NULL, &fragmentation_file_operations);
-	proc_create("pagetypeinfo", S_IRUGO, NULL, &pagetypeinfo_file_ops);
+	proc_create("pagetypeinfo", 0400, NULL, &pagetypeinfo_file_ops);
 	proc_create("vmstat", S_IRUGO, NULL, &proc_vmstat_file_operations);
 	proc_create("zoneinfo", S_IRUGO, NULL, &proc_zoneinfo_file_operations);
 #endif
@@ -1631,7 +1657,7 @@ static int unusable_show(struct seq_file *m, void *arg)
 	if (!node_state(pgdat->node_id, N_MEMORY))
 		return 0;
 
-	walk_zones_in_node(m, pgdat, false, unusable_show_print);
+	walk_zones_in_node(m, pgdat, unusable_show_print);
 
 	return 0;
 }
@@ -1683,7 +1709,7 @@ static int extfrag_show(struct seq_file *m, void *arg)
 {
 	pg_data_t *pgdat = (pg_data_t *)arg;
 
-	walk_zones_in_node(m, pgdat, false, extfrag_show_print);
+	walk_zones_in_node(m, pgdat, extfrag_show_print);
 
 	return 0;
 }
